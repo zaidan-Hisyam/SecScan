@@ -1,12 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { checkScanRateLimit } from "@/lib/security/rate-limit";
+import { runPassiveWebScan } from "@/lib/scanner/passive-scan";
+import { checkExposedFiles } from "@/lib/scanner/file-exposure";
+import { deduplicateFindings } from "@/lib/scanner/deduplicate";
 import { triggerGitHubScanWorkflow } from "@/lib/github/dispatch";
 import { Database } from "@/types/database";
 
 type DomainRow = Database["public"]["Tables"]["domains"]["Row"];
 type ScanRow = Database["public"]["Tables"]["scans"]["Row"];
 type ScanInsert = Database["public"]["Tables"]["scans"]["Insert"];
+type FindingInsert = Database["public"]["Tables"]["findings"]["Insert"];
 
 export async function GET(request: NextRequest) {
   try {
@@ -82,18 +86,18 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 3. Cek Status Verified (Aturan Keamanan Wajib)
+    // 3. Cek Status Verified
     if (!domain.verified) {
       return NextResponse.json(
         {
-          error: `Pemindaian DITOLAK: Domain '${domain.hostname}' belum terverifikasi. Anda wajib memverifikasi kepemilikan domain via DNS TXT atau File Token sebelum dapat melakukan scan.`,
+          error: `Pemindaian DITOLAK: Domain '${domain.hostname}' belum terverifikasi.`,
           code: "DOMAIN_NOT_VERIFIED",
         },
         { status: 403 }
       );
     }
 
-    // 4. Cek Rate Limit (Batas frekuensi per user & per domain)
+    // 4. Cek Rate Limit
     const rateLimit = await checkScanRateLimit(user.id, domain.id);
     if (!rateLimit.allowed) {
       return NextResponse.json(
@@ -106,15 +110,15 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 5. Inisialisasi Record Scan dengan status 'queued'
+    // 5. Inisialisasi Record Scan dengan status 'running'
     const initialScanPayload: ScanInsert = {
       domain_id: domain.id,
-      status: "queued",
+      status: "running",
       started_at: new Date().toISOString(),
       summary: {
         target_hostname: domain.hostname,
-        mode: "github_actions_worker",
-        dispatch_status: "pending",
+        mode: "hybrid_instant_worker",
+        stage: "executing",
       },
       triggered_by: user.id,
     };
@@ -132,42 +136,84 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 6. Memicu GitHub Actions Workflow via workflow_dispatch
-    const dispatchResult = await triggerGitHubScanWorkflow({
+    // 6. Jalankan Pemindaian Pasif & File Exposure Langsung (Hasil Instan)
+    const [passiveResult, exposedFilesResult] = await Promise.all([
+      runPassiveWebScan(domain.hostname),
+      checkExposedFiles(domain.hostname),
+    ]);
+
+    const combinedRawFindings = [
+      ...(passiveResult.findings || []),
+      ...(exposedFilesResult || []),
+    ];
+
+    // Deduplikasi temuan
+    const dedupedFindings = deduplicateFindings(combinedRawFindings);
+
+    // 7. Simpan Findings ke Database
+    if (dedupedFindings.length > 0) {
+      const findingsPayload: FindingInsert[] = dedupedFindings.map((f) => ({
+        scan_id: scan.id,
+        tool: f.tool,
+        rule_id: f.rule_id,
+        title: f.title,
+        severity: f.severity,
+        description: f.description,
+        evidence: f.evidence,
+        remediation: f.remediation,
+      }));
+
+      const { error: insertFindingsErr } = await supabase
+        .from("findings")
+        .insert(findingsPayload as never);
+
+      if (insertFindingsErr) {
+        console.error("Gagal menyimpan findings:", insertFindingsErr.message);
+      }
+    }
+
+    // 8. Hitung Breakdown Severity & Update Status = 'done'
+    const severityCount = {
+      critical: dedupedFindings.filter((f) => f.severity === "critical").length,
+      high: dedupedFindings.filter((f) => f.severity === "high").length,
+      medium: dedupedFindings.filter((f) => f.severity === "medium").length,
+      low: dedupedFindings.filter((f) => f.severity === "low").length,
+      info: dedupedFindings.filter((f) => f.severity === "info").length,
+    };
+
+    const finalSummary = {
+      ...passiveResult.summary,
+      exposed_files_checked: true,
+      severity_breakdown: severityCount,
+      total_findings: dedupedFindings.length,
+      completed_at: new Date().toISOString(),
+    };
+
+    const { data: finishedScan, error: updateScanErr } = await supabase
+      .from("scans")
+      .update({
+        status: "done",
+        finished_at: new Date().toISOString(),
+        summary: finalSummary,
+      } as never)
+      .eq("id", scan.id)
+      .select()
+      .single<ScanRow>();
+
+    // 9. Picu juga GitHub Actions Worker di background jika kredensial GitHub tersedia
+    triggerGitHubScanWorkflow({
       scanId: scan.id,
       hostname: domain.hostname,
-    });
-
-    if (!dispatchResult.success) {
-      // Jika dispatch gagal (misal GITHUB_TOKEN belum diisi di dev lokal), tandai info di summary
-      await supabase
-        .from("scans")
-        .update({
-          summary: {
-            target_hostname: domain.hostname,
-            mode: "github_actions_worker",
-            dispatch_status: "failed",
-            dispatch_error: dispatchResult.error,
-          },
-        } as never)
-        .eq("id", scan.id);
-
-      return NextResponse.json(
-        {
-          message: `Scan dibuat (queued), namun pemicuan GitHub Actions gagal: ${dispatchResult.error}`,
-          scan,
-          dispatch_warning: dispatchResult.error,
-        },
-        { status: 202 }
-      );
-    }
+    }).catch(() => {});
 
     return NextResponse.json(
       {
-        message: `Pemindaian untuk domain ${domain.hostname} berhasil diantrekan ke GitHub Actions Worker.`,
-        scan,
+        message: `Pemindaian untuk ${domain.hostname} selesai.`,
+        scan: finishedScan || scan,
+        findings_count: dedupedFindings.length,
+        summary: finalSummary,
       },
-      { status: 201 }
+      { status: 200 }
     );
   } catch (err: unknown) {
     return NextResponse.json(
