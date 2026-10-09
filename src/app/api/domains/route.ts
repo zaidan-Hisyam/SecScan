@@ -62,15 +62,16 @@ export async function POST(request: NextRequest) {
 
     const hostname = validation.normalized;
 
-    // 2. Generate token verifikasi kriptografis acak (24 bytes hex)
+    // 2. Generate token verifikasi
     const verifyToken = `secscan_${crypto.randomBytes(16).toString("hex")}`;
 
-    // 3. Simpan domain ke Supabase (RLS memastikan owner_id = auth.uid())
+    // 3. Simpan domain langsung dengan status verified = true (Mode Uji Coba Cepat / Direct-Scan Mode)
     const insertPayload: DomainInsert = {
       owner_id: user.id,
       hostname: hostname,
       verify_token: verifyToken,
-      verified: false,
+      verified: true, // Otomatis terverifikasi saat ditambahkan agar bisa langsung di-scan
+      verified_at: new Date().toISOString(),
     };
 
     const { data: domain, error } = await supabase
@@ -91,7 +92,7 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json(
       {
-        message: "Domain berhasil ditambahkan. Silakan lakukan verifikasi kepemilikan.",
+        message: `Domain ${hostname} berhasil ditambahkan dan langsung siap untuk dipindai.`,
         domain,
       },
       { status: 201 }
