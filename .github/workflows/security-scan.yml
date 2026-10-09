@@ -1,0 +1,49 @@
+name: "SecScan Security Worker"
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan_id:
+        description: "ID scan di database Supabase"
+        required: true
+        type: string
+      hostname:
+        description: "Hostname target yang akan dipindai (FQDN)"
+        required: true
+        type: string
+
+jobs:
+  passive_security_scan:
+    name: "Run Passive & TLS Scans"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10 # ATURAN KEAMANAN WAJIB: Batas timeout per scan agar tidak menggantung
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: "npm"
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Install testssl.sh & Dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y bsdmainutils dnsutils openssl
+          git clone --depth 1 https://github.com/drwetter/testssl.sh.git testssl-tool
+          chmod +x testssl-tool/testssl.sh
+
+      - name: Execute Comprehensive Scan & Send Webhook
+        env:
+          NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+          SCAN_WEBHOOK_URL: ${{ secrets.SCAN_WEBHOOK_URL }}
+          SCAN_WEBHOOK_SECRET: ${{ secrets.SCAN_WEBHOOK_SECRET }}
+          TARGET_SCAN_ID: ${{ github.event.inputs.scan_id }}
+          TARGET_HOSTNAME: ${{ github.event.inputs.hostname }}
+        run: |
+          node scripts/worker-runner.js
