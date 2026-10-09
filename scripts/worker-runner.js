@@ -2,18 +2,19 @@ const { createClient } = require("@supabase/supabase-js");
 const crypto = require("crypto");
 const dns = require("dns");
 const net = require("net");
-const { execSync } = require("child_process");
+const { execFile, execFileSync } = require("child_process");
 const fs = require("fs");
 
 /**
- * Worker Standalone Script untuk GitHub Actions:
+ * Worker Comprehensive Scan:
  * 1. Validasi ulang status domain di Supabase (verified == true)
- * 2. Cek Anti-SSRF pada hostname
- * 3. Jalankan passive headers & cookie checks
- * 4. Jalankan exposed files check (.env, .git, backup)
- * 5. Jalankan testssl.sh dengan output JSON
- * 6. Normalisasi seluruh temuan ke satu format
- * 7. Kirim hasil terenkripsi HMAC ke Webhook Portal
+ * 2. Cek Anti-SSRF pada target hostname
+ * 3. Passive checks (Security Headers, Cookie Flags)
+ * 4. Exposed files check (.env, .git, backup.sql)
+ * 5. Nuclei scan (Hanya template exposures, misconfiguration, technologies dengan rate-limit ketat)
+ * 6. testssl.sh scan (TLS/SSL cipher suites)
+ * 7. Deduplikasi temuan berdasarkan rule_id + matched_url
+ * 8. Kirim payload terverifikasi HMAC ke Webhook Portal
  */
 
 function generateSignature(payloadStr, secret) {
@@ -28,6 +29,7 @@ function isPrivateIP(ip) {
     if (a === 169 && b === 254) return true;
     if (a === 172 && b >= 16 && b <= 31) return true;
     if (a === 192 && b === 168) return true;
+    if (a === 100 && b >= 64 && b <= 127) return true;
     if (a >= 224) return true;
     return false;
   }
@@ -37,6 +39,36 @@ function isPrivateIP(ip) {
     return false;
   }
   return true;
+}
+
+const SEVERITY_WEIGHT = { critical: 5, high: 4, medium: 3, low: 2, info: 1 };
+
+function deduplicateFindings(findings) {
+  const mergedMap = new Map();
+
+  for (const item of findings) {
+    const urlKey = (item.matched_url || item.evidence || "root").toLowerCase().trim().replace(/\/+$/, "");
+    const dedupeKey = `${item.rule_id.toLowerCase()}::${urlKey}`;
+
+    if (!mergedMap.has(dedupeKey)) {
+      mergedMap.set(dedupeKey, { ...item });
+    } else {
+      const existing = mergedMap.get(dedupeKey);
+      const existingWeight = SEVERITY_WEIGHT[existing.severity] || 0;
+      const currentWeight = SEVERITY_WEIGHT[item.severity] || 0;
+      if (currentWeight > existingWeight) {
+        existing.severity = item.severity;
+      }
+      if (item.evidence && existing.evidence && !existing.evidence.includes(item.evidence)) {
+        existing.evidence = `${existing.evidence}\n[${item.tool}] ${item.evidence}`.slice(0, 800);
+      }
+      if (!existing.tool.includes(item.tool)) {
+        existing.tool = `${existing.tool}, ${item.tool}`;
+      }
+    }
+  }
+
+  return Array.from(mergedMap.values());
 }
 
 async function sendWebhookResult(webhookUrl, webhookSecret, payload) {
@@ -58,22 +90,42 @@ async function sendWebhookResult(webhookUrl, webhookSecret, payload) {
   console.log(`[Worker] Webhook response status: ${res.status}, body: ${resText}`);
 }
 
+// Eksekusi biner eksternal dengan Array arguments (Anti Command Injection)
+function runSafeBinary(command, args, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, { timeout: timeoutMs }, (error, stdout, stderr) => {
+      if (error && error.killed) {
+        return reject(new Error(`Command timed out after ${timeoutMs}ms`));
+      }
+      resolve({ stdout, stderr, error });
+    });
+  });
+}
+
 async function main() {
   const scanId = process.env.TARGET_SCAN_ID;
-  const hostname = process.env.TARGET_HOSTNAME;
+  const rawHostname = process.env.TARGET_HOSTNAME;
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
   const webhookUrl = process.env.SCAN_WEBHOOK_URL;
   const webhookSecret = process.env.SCAN_WEBHOOK_SECRET;
 
-  if (!scanId || !hostname || !supabaseUrl || !serviceRoleKey || !webhookUrl || !webhookSecret) {
+  if (!scanId || !rawHostname || !supabaseUrl || !serviceRoleKey || !webhookUrl || !webhookSecret) {
     console.error("❌ Variabel lingkungan worker belum lengkap!");
+    process.exit(1);
+  }
+
+  // Sanitasi hostname ketat dengan whitelist
+  const hostname = rawHostname.trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0].split(":")[0];
+  const hostnameRegex = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*\.[a-z]{2,}$/;
+  if (!hostnameRegex.test(hostname)) {
+    console.error(`❌ Hostname tidak valid: ${hostname}`);
     process.exit(1);
   }
 
   console.log(`[Worker] Memulai pemindaian: Scan ID=${scanId}, Target Hostname=${hostname}`);
   const startTime = Date.now();
-  const allFindings = [];
+  let allFindings = [];
 
   const supabase = createClient(supabaseUrl, serviceRoleKey);
 
@@ -143,6 +195,7 @@ async function main() {
         description: "HSTS melindungi pengguna dari serangan SSL Stripping dan downgrade HTTP.",
         evidence: "Header 'Strict-Transport-Security' tidak ditemukan.",
         remediation: "Tambahkan header: Strict-Transport-Security: max-age=31536000; includeSubDomains; preload",
+        matched_url: `https://${hostname}/`,
       });
     }
 
@@ -155,6 +208,7 @@ async function main() {
         description: "CSP membatasi sumber skrip dan aset untuk mencegah serangan XSS.",
         evidence: "Header 'Content-Security-Policy' tidak ditemukan.",
         remediation: "Terapkan Content-Security-Policy yang membatasi script-src, object-src, dan default-src.",
+        matched_url: `https://${hostname}/`,
       });
     }
 
@@ -167,6 +221,7 @@ async function main() {
         description: "Situs dapat disematkan ke dalam iframe oleh web pihak ketiga.",
         evidence: "Header 'X-Frame-Options' tidak ditemukan.",
         remediation: "Tambahkan header: X-Frame-Options: SAMEORIGIN",
+        matched_url: `https://${hostname}/`,
       });
     }
   } catch (err) {
@@ -198,6 +253,7 @@ async function main() {
             description: `File sensitif ${item.path} ditemukan dan dapat diakses publik tanpa autentikasi.`,
             evidence: `Path: ${item.path} (HTTP 200 OK)`,
             remediation: `Blokir akses ke ${item.path} pada konfigurasi web server Anda.`,
+            matched_url: `https://${hostname}${item.path}`,
           });
         }
       }
@@ -206,20 +262,72 @@ async function main() {
     }
   }
 
-  // 5. MENJALANKAN TESTSSL.SH (JIKA TERSEDIA)
-  console.log("[Worker] 5. Menjalankan testssl.sh...");
+  // 5. NUCLEI SCANNER (MENGGUNAKAN EXECFILE + ARG ARRAY TANPA STRING CONCATENATION)
+  console.log("[Worker] 5. Menjalankan Nuclei Scanner (Exposures, Misconfigurations, Technologies)...");
+  try {
+    const nucleiArgs = [
+      "-u", `https://${hostname}`,
+      "-tags", "exposure,misconfiguration,tech",
+      "-rate-limit", "15",
+      "-c", "5",
+      "-timeout", "5",
+      "-silent",
+      "-jsonl",
+      "-o", "nuclei_out.jsonl",
+    ];
+
+    await runSafeBinary("nuclei", nucleiArgs, 300000);
+
+    if (fs.existsSync("nuclei_out.jsonl")) {
+      const nucleiContent = fs.readFileSync("nuclei_out.jsonl", "utf8");
+      const lines = nucleiContent.split("\n");
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+        try {
+          const item = JSON.parse(line.trim());
+          const ruleId = item["template-id"] || item.templateID || "nuclei-finding";
+          const info = item.info || {};
+          const rawSev = (info.severity || "info").toLowerCase();
+          const matchedAt = item["matched-at"] || item.matchedAt || item.host || `https://${hostname}`;
+
+          let severity = "info";
+          if (rawSev === "critical") severity = "critical";
+          else if (rawSev === "high") severity = "high";
+          else if (rawSev === "medium") severity = "medium";
+          else if (rawSev === "low") severity = "low";
+
+          allFindings.push({
+            tool: "nuclei",
+            rule_id: ruleId,
+            title: info.name || ruleId,
+            severity: severity,
+            description: info.description || `Nuclei mendeteksi indikasi temuan ${ruleId}.`,
+            evidence: `Matched: ${matchedAt}`.slice(0, 500),
+            remediation: info.remediation || "Tinjau konfigurasi komponen terkait dan perbarui ke versi yang aman.",
+            matched_url: matchedAt,
+          });
+        } catch {
+          // Abaikan baris parse error
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("[Worker] Nuclei execution notice:", err.message);
+  }
+
+  // 6. TESTSSL.SH SCANNER (MENGGUNAKAN EXECFILE + ARG ARRAY)
+  console.log("[Worker] 6. Menjalankan testssl.sh...");
   try {
     if (fs.existsSync("./testssl-tool/testssl.sh")) {
-      const testsslCmd = `./testssl-tool/testssl.sh --quiet --fast --jsonfile-pretty testssl_out.json ${hostname}`;
-      console.log(`[Worker] Eksekusi: ${testsslCmd}`);
-      execSync(testsslCmd, { timeout: 180000 }); // Max 3 menit
+      const testsslArgs = ["--quiet", "--fast", "--jsonfile-pretty", "testssl_out.json", hostname];
+      await runSafeBinary("./testssl-tool/testssl.sh", testsslArgs, 180000);
 
       if (fs.existsSync("testssl_out.json")) {
         const testsslData = JSON.parse(fs.readFileSync("testssl_out.json", "utf8"));
-        // Parse hasil testssl sederhana
         if (Array.isArray(testsslData)) {
           for (const row of testsslData) {
-            if (row.severity === "CRITICAL" || row.severity === "HIGH") {
+            if (row.severity === "CRITICAL" || row.severity === "HIGH" || row.severity === "MEDIUM") {
               allFindings.push({
                 tool: "testssl.sh",
                 rule_id: `testssl-${row.id || "vuln"}`,
@@ -228,37 +336,41 @@ async function main() {
                 description: row.finding || "Masalah konfigurasi SSL/TLS terdeteksi.",
                 evidence: `Severity: ${row.severity}, Detail: ${row.finding}`,
                 remediation: "Perbarui cipher suite dan konfigurasi SSL/TLS web server Anda.",
+                matched_url: `https://${hostname}:443`,
               });
             }
           }
         }
       }
-    } else {
-      console.log("[Worker] testssl.sh tidak ditemukan di direktori lokal, melewati langkah testssl.");
     }
   } catch (err) {
-    console.warn("[Worker] testssl.sh selesai dengan peringatan:", err.message);
+    console.warn("[Worker] testssl.sh notice:", err.message);
   }
 
-  // 6. KIRIM HASIL KE WEBHOOK
-  console.log(`[Worker] 6. Mengirim ${allFindings.length} temuan ke Webhook Portal...`);
+  // 7. DEDUPLIKASI TEMUAN (RULE_ID + MATCHED_URL)
+  console.log(`[Worker] 7. Melakukan deduplikasi pada ${allFindings.length} temuan mentah...`);
+  const deduplicatedFindings = deduplicateFindings(allFindings);
+  console.log(`[Worker] Total temuan setelah deduplikasi: ${deduplicatedFindings.length}`);
+
+  // 8. KIRIM HASIL KE WEBHOOK
   const finalSummary = {
-    total_findings: allFindings.length,
+    total_findings: deduplicatedFindings.length,
     duration_ms: Date.now() - startTime,
     scanned_at: new Date().toISOString(),
+    scanners_executed: ["custom_headers", "file_exposure", "nuclei", "testssl"],
   };
 
   await sendWebhookResult(webhookUrl, webhookSecret, {
     scan_id: scanId,
     status: "done",
     summary: finalSummary,
-    findings: allFindings,
+    findings: deduplicatedFindings,
   });
 
-  console.log("[Worker] Pemindaian selesai dengan sukses!");
+  console.log("[Worker] Seluruh alur pemindaian selesai 100%!");
 }
 
 main().catch(async (err) => {
-  console.error("❌ Worker unhandled fatal error:", err);
+  console.error("❌ Worker fatal error:", err);
   process.exit(1);
 });

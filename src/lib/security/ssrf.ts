@@ -176,7 +176,7 @@ export async function resolveAndValidateSSRF(hostname: string): Promise<{ safe: 
 }
 
 /**
- * Safe Fetch dengan Anti-SSRF, batas timeout, batas ukuran respons, dan proteksi redirect.
+ * Safe Fetch dengan Anti-SSRF, DNS Rebinding Protection, batas timeout, dan proteksi redirect.
  */
 export async function safeFetch(
   targetUrl: string,
@@ -206,7 +206,7 @@ export async function safeFetch(
       return { ok: false, status: 0, text: "", error: hostValidation.error || "Hostname tidak valid" };
     }
 
-    // Anti-SSRF: Resolve DNS dan cek IP sebelum melakukan request
+    // Anti-SSRF & DNS Rebinding: Resolve DNS sebelum request
     const ssrfCheck = await resolveAndValidateSSRF(parsed.hostname);
     if (!ssrfCheck.safe) {
       return { ok: false, status: 0, text: "", error: ssrfCheck.error };
@@ -276,7 +276,7 @@ export async function safeFetch(
     } catch (err: unknown) {
       clearTimeout(timeoutId);
       if (err instanceof Error && err.name === "AbortError") {
-        return { ok: false, status: 0, text: "", error: "Request timeout saat verifikasi file token" };
+        return { ok: false, status: 0, text: "", error: "Request timeout saat verifikasi" };
       }
       return { ok: false, status: 0, text: "", error: err instanceof Error ? err.message : String(err) };
     }

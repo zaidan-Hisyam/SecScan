@@ -14,7 +14,7 @@ body {
   min-height: 100vh;
 }
 
-/* Scrollbar cyber styling */
+/* Scrollbar styling */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
@@ -28,4 +28,52 @@ body {
 }
 ::-webkit-scrollbar-thumb:hover {
   background: #30363d;
+}
+
+/* Print & PDF Export Styling */
+@media print {
+  body {
+    background: #ffffff !important;
+    color: #111827 !important;
+  }
+
+  header,
+  .no-print {
+    display: none !important;
+  }
+
+  .print-page-container {
+    max-width: 100% !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  .print-card {
+    background: #ffffff !important;
+    border: 1px solid #e5e7eb !important;
+    color: #111827 !important;
+    box-shadow: none !important;
+    page-break-inside: avoid;
+    margin-bottom: 12px !important;
+  }
+
+  .print-text-dark {
+    color: #111827 !important;
+  }
+
+  .print-text-muted {
+    color: #4b5563 !important;
+  }
+
+  .print-box-evidence {
+    background: #f9fafb !important;
+    border: 1px solid #e5e7eb !important;
+    color: #1f2937 !important;
+  }
+
+  .print-box-remediation {
+    background: #f0fdf4 !important;
+    border: 1px solid #bbf7d0 !important;
+    color: #166534 !important;
+  }
 }

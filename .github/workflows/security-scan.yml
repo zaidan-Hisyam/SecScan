@@ -13,8 +13,8 @@ on:
         type: string
 
 jobs:
-  passive_security_scan:
-    name: "Run Passive & TLS Scans"
+  comprehensive_security_scan:
+    name: "Run Passive, Nuclei & TLS Scans"
     runs-on: ubuntu-latest
     timeout-minutes: 10 # ATURAN KEAMANAN WAJIB: Batas timeout per scan agar tidak menggantung
 
@@ -36,6 +36,20 @@ jobs:
           sudo apt-get update && sudo apt-get install -y bsdmainutils dnsutils openssl
           git clone --depth 1 https://github.com/drwetter/testssl.sh.git testssl-tool
           chmod +x testssl-tool/testssl.sh
+
+      - name: Install Nuclei Engine (ProjectDiscovery)
+        run: |
+          curl -s https://api.github.com/repos/projectdiscovery/nuclei/releases/latest \
+            | grep "browser_download_url.*nuclei.*linux_amd64.zip" \
+            | cut -d : -f 2,3 \
+            | tr -d \" \
+            | wget -qi - -O nuclei.zip
+          unzip -q nuclei.zip
+          chmod +x nuclei
+          sudo mv nuclei /usr/local/bin/
+          nuclei -version
+          # Download templates terpilih
+          nuclei -update-templates
 
       - name: Execute Comprehensive Scan & Send Webhook
         env:
